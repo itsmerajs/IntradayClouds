@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""Raj Intraday Clouds — SHADOW alert scanner (standalone, Oct 27 2026).
+
+Raj's explicit build order (chat, Oct 27 2026): a NEW standalone intraday
+job, separate from the MTF swing scanner (mtf-swing-scan.py is NOT touched).
+Alerts fire from day one but are paper/shadow-tracked and graded; every
+card built from this output must be labeled SHADOW.
+
+Cloud logic copied from mtf-swing-scan.py raj_clouds()/_cloud_state():
+  state = 'bull' if fast EMA > slow EMA AND fast rising (last vs previous)
+          'bear' if fast EMA < slow EMA AND fast falling
+          else 'flat'. Completed bars only.
+Raj's 4 rules, intraday mapping:
+  1. 5/12 curl (on 5-MIN bars)   -> entry / first signal  (FIRST alert)
+  2. 34/50 curl (on 5-MIN bars)  -> stronger confirmation (CONFIRMED upgrade)
+  3. 1HR MTF (hourly EMA 8/21)   -> hold guidance; flip against = EXIT alert
+  4. Daily trend (EMA21>EMA20 AND EMA55>EMA50 -> bull, inverse -> bear)
+                                 -> day bias gate for FIRST alerts
+
+Universe: SPY, QQQ, IWM, TSLA, NVDA, MSFT, AMZN (always-on, Raj Oct 27 2026)
++ tickers parsed from today's Morning Desk report
+(newest ~/workspace/morning-desk/reports/YYYY-MM-DD.md watchlist / top-ideas
+sections). Cap 25.
+
+Output: ONE JSON object on stdout:
+  {"quiet": bool, "alerts": [...], "grades": [...],
+   "universe": [...], "notes": [...]}
+All diagnostics go to stderr. Never raises.
+"""
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+
+import numpy as np
+import pandas as pd
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+BASE = os.path.expanduser("~/workspace/goals/morning-trading-desk/hidden_files")
+STATE_FILE = os.path.join(BASE, "raj-intraday-clouds-state.json")
+AUDIT_FILE = os.path.join(BASE, "raj-intraday-clouds-alerts.jsonl")
+REPORTS_DIR = os.path.expanduser("~/workspace/morning-desk/reports")
+BASE_TICKERS = ["SPY", "QQQ", "IWM", "TSLA", "NVDA", "MSFT", "AMZN"]
+MAX_UNIVERSE = 25
+YH_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+
+
+def now_et():
+    return dt.datetime.now(ET)  # DST-safe (same helper as mtf-swing-scan.py)
+
+
+def log(msg):
+    print(f"[raj-clouds {now_et().strftime('%H:%M:%S')}] {msg}",
+          file=sys.stderr, flush=True)
+
+
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+# ---------------------------------------------------------------- Yahoo bars
+def yahoo_bars(ticker, interval, range_):
+    """Fetch OHLCV via Yahoo chart API. Returns DataFrame (UTC index) or None.
+    Same approach as mtf-swing-scan.py's yahoo_bars."""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+           f"?interval={interval}&range={range_}&events=div%2Csplit")
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers=YH_UA)
+            raw = urllib.request.urlopen(req, timeout=15).read()
+            j = json.loads(raw)
+            r = j["chart"]["result"][0]
+            ts = r["timestamp"]
+            q = r["indicators"]["quote"][0]
+            df = pd.DataFrame({
+                "Open": q.get("open"), "High": q.get("high"),
+                "Low": q.get("low"), "Close": q.get("close"),
+                "Volume": q.get("volume"),
+            }, index=pd.to_datetime(ts, unit="s", utc=True))
+            df = df.dropna(subset=["Close"])
+            if len(df) < 5:
+                return None
+            return df
+        except Exception as e:
+            if attempt == 2:
+                log(f"yahoo_bars {ticker} {interval} failed: {e}")
+            time.sleep(1 + attempt * 2)
+    return None
+
+
+def completed(df, bar_len):
+    """Convert index to ET and drop a still-forming last bar
+    (bar start + bar length > now ET = incomplete)."""
+    if df is None or len(df) == 0:
+        return df
+    d = df.copy()
+    d.index = d.index.tz_convert(ET)
+    now = now_et()
+    if d.index[-1] + bar_len > now:
+        d = d.iloc[:-1]
+    return d
+
+
+# ---------------------------------------------------------------- cloud logic
+# Copied from mtf-swing-scan.py _cloud_state() / raj_clouds() (Oct 19 2026).
+def _cloud_state(fast, slow):
+    """'bull' if fast>slow and fast rising; 'bear' if fast<slow and falling;
+    else 'flat'. fast/slow are EMA series (last value = latest completed)."""
+    try:
+        f0, f1 = float(fast.iloc[-1]), float(fast.iloc[-2])
+        s0 = float(slow.iloc[-1])
+        if np.isnan(f0) or np.isnan(f1) or np.isnan(s0):
+            return "flat"
+        if f0 > s0 and f0 > f1:
+            return "bull"
+        if f0 < s0 and f0 < f1:
+            return "bear"
+        return "flat"
+    except Exception:
+        return "flat"
+
+
+def daily_trend(daily_closes):
+    """Rule 4, copied from raj_clouds(): EMA21>EMA20 AND EMA55>EMA50 -> bull;
+    inverse -> bear; else flat. Needs >= 56 daily closes."""
+    dc = pd.Series(daily_closes, dtype=float).dropna()
+    if len(dc) < 56:
+        return "flat"
+    e20, e21 = ema(dc, 20), ema(dc, 21)
+    e50, e55 = ema(dc, 50), ema(dc, 55)
+    bull = (float(e21.iloc[-1]) > float(e20.iloc[-1])
+            and float(e55.iloc[-1]) > float(e50.iloc[-1]))
+    bear = (float(e21.iloc[-1]) < float(e20.iloc[-1])
+            and float(e55.iloc[-1]) < float(e50.iloc[-1]))
+    return "bull" if bull else ("bear" if bear else "flat")
+
+
+def ticker_states(daily_df, hourly_df, m5_df):
+    """All four cloud states for one ticker from completed bars."""
+    out = {"dtrend": "flat", "m5_12": "flat", "m34_50": "flat", "h1": "flat"}
+    if daily_df is not None and len(daily_df) > 0:
+        out["dtrend"] = daily_trend(daily_df["Close"])
+    if hourly_df is not None:
+        hc = hourly_df["Close"].dropna()
+        if len(hc) >= 25:  # same warmup as mtf raj_clouds h1
+            out["h1"] = _cloud_state(ema(hc, 8), ema(hc, 21))
+    if m5_df is not None:
+        mc = m5_df["Close"].dropna()
+        if len(mc) >= 14:
+            out["m5_12"] = _cloud_state(ema(mc, 5), ema(mc, 12))
+        if len(mc) >= 52:
+            out["m34_50"] = _cloud_state(ema(mc, 34), ema(mc, 50))
+    return out
+
+
+# ---------------------------------------------------------------- universe
+_SECTION_KEYS = ("WATCHLIST", "TOP IDEAS", "TOP 3 OPPORTUNITIES", "BATTLE PLAN")
+_TICKER_LINE = re.compile(
+    r"^\s*(?:\d+\.\s+|-\s+)?([A-Z]{1,5})(?:\s*·|\s+—|\s+–|\s+-\s)")
+_STOPWORDS = {"THE", "AND", "FOR", "TOP", "LONG", "SHORT", "KEY", "NEW"}
+
+
+def parse_report_tickers(path):
+    """Extract plausible tickers from watchlist / top-ideas sections only."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except Exception as e:
+        log(f"report read failed {path}: {e}")
+        return []
+    found, seen, in_section = [], set(), False
+    for line in lines:
+        if line.startswith("##"):
+            in_section = any(k in line.upper() for k in _SECTION_KEYS)
+            continue
+        if line.startswith("**") and any(
+                k in line.upper() for k in _SECTION_KEYS):
+            in_section = True
+            continue
+        if line.startswith("**") and in_section and not any(
+                k in line.upper() for k in _SECTION_KEYS):
+            # a new bold sub-heading that is not a watched section
+            if re.match(r"^\*\*\d+\.", line):
+                in_section = False
+                continue
+        if not in_section:
+            continue
+        m = _TICKER_LINE.match(line)
+        if m:
+            t = m.group(1)
+            if t not in _STOPWORDS and t not in seen:
+                seen.add(t)
+                found.append(t)
+    return found
+
+
+def build_universe(notes):
+    tickers = list(BASE_TICKERS)
+    path = None
+    today_name = now_et().strftime("%Y-%m-%d") + ".md"
+    cand = os.path.join(REPORTS_DIR, today_name)
+    if os.path.exists(cand):
+        path = cand
+    else:
+        try:
+            names = sorted(n for n in os.listdir(REPORTS_DIR)
+                           if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.md", n))
+            if names:
+                path = os.path.join(REPORTS_DIR, names[-1])
+        except Exception as e:
+            log(f"reports dir scan failed: {e}")
+    if path is None:
+        notes.append("No Morning Desk report found — universe = always-on only.")
+        return tickers
+    extra = parse_report_tickers(path)
+    if not extra:
+        notes.append(f"No tickers parsed from {os.path.basename(path)} — "
+                     "universe = always-on only.")
+    for t in extra:
+        if t not in tickers:
+            tickers.append(t)
+    return tickers[:MAX_UNIVERSE]
+
+
+# ---------------------------------------------------------------- state file
+def load_state(today):
+    """Load state; re-init for a new trading day (reset priors + open alerts)."""
+    fresh = {"date": today, "initialized": False, "tickers": {},
+             "alerts_today": [], "graded_ids": []}
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                st = json.load(f)
+            if st.get("date") == today:
+                for k, v in fresh.items():
+                    st.setdefault(k, v)
+                return st, False
+    except Exception as e:
+        log(f"state read failed: {e}")
+    return fresh, True
+
+
+def save_state(st):
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log(f"state write failed: {e}")
+
+
+def append_audit(rec):
+    try:
+        with open(AUDIT_FILE, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        log(f"audit write failed: {e}")
+
+
+# ---------------------------------------------------------------- grading
+def grade_alerts(st, m5_by_ticker, today):
+    """Grade today's ungraded FIRST alerts on today's completed 5m
+    bars after entry: +0.50% in direction first = WIN, -0.50% first = LOSS
+    (same-bar both-hit counts as LOSS, conservative), else FLAT at close.
+    CONFIRMED records are upgrades of a FIRST signal (same entry) and are
+    NEVER graded separately — Raj's fix, Oct 28 2026."""
+    grades = []
+    for rec in st.get("alerts_today", []):
+        if rec.get("level") in ("EXIT", "CONFIRMED"):
+            continue
+        if rec["id"] in st.get("graded_ids", []):
+            continue
+        df = m5_by_ticker.get(rec["ticker"])
+        if df is None or len(df) == 0:
+            continue
+        entry = float(rec["price"])
+        sign = 1 if rec["dir"] == "LONG" else -1
+        fav, adv = entry * 1.005, entry * 0.995
+        if sign < 0:
+            fav, adv = entry * 0.995, entry * 1.005
+        bars = df[df.index.strftime("%Y-%m-%d") == today]
+        ent = dt.datetime.fromisoformat(rec["entry_time_iso"])
+        if ent.tzinfo is None:
+            ent = ent.replace(tzinfo=ET)
+        bars = bars[bars.index > ent]
+        result = "FLAT"
+        for _, b in bars.iterrows():
+            hi, lo = float(b["High"]), float(b["Low"])
+            if sign > 0:
+                hit_fav, hit_adv = hi >= fav, lo <= adv
+            else:
+                hit_fav, hit_adv = lo <= fav, hi >= adv
+            if hit_adv:
+                result = "LOSS"
+                break
+            if hit_fav:
+                result = "WIN"
+                break
+        st["graded_ids"].append(rec["id"])
+        grades.append({"ticker": rec["ticker"], "dir": rec["dir"],
+                       "level": rec["level"], "entry": entry,
+                       "entry_time": rec["time"], "result": result})
+    return grades
+
+
+# ---------------------------------------------------------------- main
+def main():
+    notes, alerts, grades = [], [], []
+    now = now_et()
+    today = now.strftime("%Y-%m-%d")
+    universe = build_universe(notes)
+    st, is_new_day = load_state(today)
+    initializing = (not st.get("initialized")) or is_new_day
+
+    m5_by_ticker = {}
+    for t in universe:
+        try:
+            daily = completed(yahoo_bars(t, "1d", "1y"), dt.timedelta(days=1))
+            hourly = completed(yahoo_bars(t, "1h", "5d"), dt.timedelta(hours=1))
+            m5 = completed(yahoo_bars(t, "5m", "5d"), dt.timedelta(minutes=5))
+            if m5 is None or len(m5) == 0:
+                notes.append(f"{t}: no 5m data — skipped this run.")
+                continue
+            m5_by_ticker[t] = m5
+            states = ticker_states(daily, hourly, m5)
+            mc = m5["Close"].dropna()
+            last_close = float(mc.iloc[-1])
+            ema12 = float(ema(mc, 12).iloc[-1]) if len(mc) >= 12 else None
+            bar_time = m5.index[-1]
+            bar_time_s = bar_time.strftime("%Y-%m-%d %H:%M ET")
+            tstate = st["tickers"].setdefault(
+                t, {"prev": None, "open_alert": None})
+            prev = tstate.get("prev") or {}
+            open_a = tstate.get("open_alert")
+
+            if not initializing:
+                want = {"LONG": "bull", "SHORT": "bear"}
+                opp = {"LONG": "bear", "SHORT": "bull"}
+                # EXIT first: 1HR cloud flips against the open alert.
+                if open_a and states["h1"] == opp[open_a["dir"]]:
+                    a = {"ticker": t, "dir": open_a["dir"], "level": "EXIT",
+                         "price": round(last_close, 2), "time": bar_time_s,
+                         "ema12": round(ema12, 2) if ema12 else None,
+                         "entry_price": open_a["entry_price"],
+                         "entry_time": open_a["entry_time"],
+                         "states": dict(states)}
+                    alerts.append(a)
+                    append_audit({"ts": now.strftime("%Y-%m-%d %H:%M:%S ET"),
+                                  **a})
+                    open_a = None
+                    tstate["open_alert"] = None
+                # CONFIRMED upgrade: 34/50 cloud agrees with the direction.
+                if open_a and open_a.get("level") == "FIRST" \
+                        and states["m34_50"] == want[open_a["dir"]]:
+                    a = {"ticker": t, "dir": open_a["dir"],
+                         "level": "CONFIRMED",
+                         "price": round(last_close, 2), "time": bar_time_s,
+                         "ema12": round(ema12, 2) if ema12 else None,
+                         "entry_price": open_a["entry_price"],
+                         "entry_time": open_a["entry_time"],
+                         "states": dict(states)}
+                    alerts.append(a)
+                    append_audit({"ts": now.strftime("%Y-%m-%d %H:%M:%S ET"),
+                                  **a})
+                    st["alerts_today"].append(
+                        {"id": f"{t}-CONFIRMED-{open_a['entry_time']}",
+                         "ticker": t, "dir": open_a["dir"],
+                         "level": "CONFIRMED", "price": open_a["entry_price"],
+                         "time": open_a["entry_time"],
+                         "entry_time_iso": open_a["entry_time_iso"]})
+                    open_a["level"] = "CONFIRMED"
+                # FIRST: 5/12 cloud flips, daily trend does not oppose.
+                if not open_a and prev.get("m5_12") is not None \
+                        and prev.get("m5_12") != states["m5_12"]:
+                    d = None
+                    if states["m5_12"] == "bull" and states["dtrend"] != "bear":
+                        d = "LONG"
+                    elif states["m5_12"] == "bear" \
+                            and states["dtrend"] != "bull":
+                        d = "SHORT"
+                    if d:
+                        a = {"ticker": t, "dir": d, "level": "FIRST",
+                             "price": round(last_close, 2), "time": bar_time_s,
+                             "ema12": round(ema12, 2) if ema12 else None,
+                             "entry_price": round(last_close, 2),
+                             "entry_time": bar_time_s,
+                             "states": dict(states)}
+                        alerts.append(a)
+                        append_audit({"ts": now.strftime("%Y-%m-%d %H:%M:%S ET"),
+                                      **a})
+                        entry_iso = bar_time.isoformat()
+                        st["alerts_today"].append(
+                            {"id": f"{t}-FIRST-{bar_time_s}", "ticker": t,
+                             "dir": d, "level": "FIRST",
+                             "price": round(last_close, 2),
+                             "time": bar_time_s, "entry_time_iso": entry_iso})
+                        tstate["open_alert"] = {
+                            "dir": d, "level": "FIRST",
+                            "entry_price": round(last_close, 2),
+                            "entry_time": bar_time_s,
+                            "entry_time_iso": entry_iso}
+            tstate["prev"] = dict(states)
+        except Exception as e:
+            log(f"{t} failed: {e}")
+            notes.append(f"{t}: data error this run — skipped.")
+        time.sleep(0.2)
+
+    if initializing:
+        st["initialized"] = True
+        notes.append("First run of the day — state initialized silently, "
+                     "no alerts.")
+
+    if now.hour * 60 + now.minute >= 16 * 60 + 5:
+        try:
+            grades = grade_alerts(st, m5_by_ticker, today)
+        except Exception as e:
+            log(f"grading failed: {e}")
+            notes.append("Grading failed this run — will retry next run.")
+
+    save_state(st)
+    out = {"quiet": not alerts and not grades, "alerts": alerts,
+           "grades": grades, "universe": universe, "notes": notes}
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # never raise — emit a quiet JSON with the error
+        print(json.dumps({"quiet": True, "alerts": [], "grades": [],
+                          "universe": BASE_TICKERS,
+                          "notes": [f"fatal: {e}"]}))

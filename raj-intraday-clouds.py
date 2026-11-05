@@ -47,6 +47,16 @@ their Yahoo responses include the still-forming bar, so their values can
 change at any moment. All logic, gates, state handling and outputs are
 the original's, unchanged.
 
+VOLUME CANDIDATE (Nov 4 2026 — Raj approved in chat, "Go as
+recommended"): instrumentation ONLY — no gate, target, trigger, stop,
+or exit reads any of these values, and no existing field changes
+meaning except vol_ratio's measurement basis. Differences vs the live
+scanner are confined to _levels_for and its three call sites:
+(a) vol_ratio now uses COMPLETED 5m bars only; (b) PULLBACK records
+gain pb_vol_ratio / pb_vol_tag (pullback volume dry-up proxy);
+(c) all entry records gain day_pace_ratio / day_pace_tag (cumulative
+session volume vs the 20-session average pace). NOT swapped into live.
+
 Output: ONE JSON object on stdout:
   {"quiet": bool, "alerts": [...], "grades": [...],
    "universe": [...], "notes": [...]}
@@ -56,6 +66,7 @@ import datetime as dt
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -244,16 +255,42 @@ def _daily_bars_cached(t, today):
 #   room_up_pct / room_down_pct — % distance from the entry price to the
 #             nearest level above / below (nearest of the four levels on
 #             each side); null when no level exists on that side.
-#   vol_ratio — the record bar's volume (the last bar of the same 5m
-#             series the entry fired on; entries fire intrabar by design,
-#             so this is that bar's volume as of the run) over the mean
-#             volume of the prior 20 bars; null when volume data is
-#             incomplete. vol_tag = "spike" when vol_ratio >= 1.5, else
-#             "normal"; null when vol_ratio is null.
-def _levels_for(daily_df, prepost_df, m5_df, entry_price, today):
+#   vol_ratio — COMPLETED-BAR BASIS (volume candidate, Nov 4 2026):
+#             the last COMPLETED 5m bar's volume over the mean volume
+#             of the prior 20 completed bars. The m5 frame's last row
+#             is the still-forming entry bar (entries fire intrabar by
+#             design), whose partial volume biased the old
+#             as-of-the-run ratio low, so it is excluded here; null
+#             when fewer than 21 completed bars are available or the
+#             volume data is incomplete. vol_tag = "spike" when
+#             vol_ratio >= 1.5, else "normal"; null when vol_ratio
+#             is null.
+#   day_pace_ratio / day_pace_tag (volume candidate, Nov 4 2026; all
+#             entry records) — cumulative regular-session volume today
+#             through the last completed 5m bar, over the mean total
+#             daily volume of the last 20 completed daily sessions
+#             scaled by the elapsed fraction of the 390-minute session
+#             at that bar's close. day_pace_tag = "in-play" when the
+#             ratio >= 1.5, else "normal"; both null when the daily
+#             frame or today's completed bars are incomplete.
+#   pb_vol_ratio / pb_vol_tag (volume candidate, Nov 4 2026; PULLBACK
+#             records ONLY) — documented PROXY for pullback volume
+#             dry-up: mean volume of the 3 completed bars immediately
+#             before the entry bar (late pullback bars) over the mean
+#             volume of the 3 completed bars before those (impulse
+#             bars). pb_vol_tag = "dry" when ratio < 0.8, "heavy" when
+#             >= 1.2, else "normal"; both null when fewer than 6
+#             completed bars precede the entry bar or the data is
+#             incomplete.
+def _levels_for(daily_df, prepost_df, m5_df, entry_price, today,
+                level=None):
     out = {"pdh": None, "pdl": None, "pmh": None, "pml": None,
            "room_up_pct": None, "room_down_pct": None,
-           "vol_ratio": None, "vol_tag": None}
+           "vol_ratio": None, "vol_tag": None,
+           "day_pace_ratio": None, "day_pace_tag": None}
+    if level == "PULLBACK":
+        out["pb_vol_ratio"] = None
+        out["pb_vol_tag"] = None
     if daily_df is not None and len(daily_df):
         try:
             hi = float(daily_df["High"].iloc[-1])
@@ -290,17 +327,65 @@ def _levels_for(daily_df, prepost_df, m5_df, entry_price, today):
         if below:
             out["room_down_pct"] = round(
                 (entry_price - max(below)) / entry_price * 100, 2)
-    if m5_df is not None and len(m5_df) >= 21:
+    if m5_df is not None and len(m5_df):
         try:
-            vols = m5_df["Volume"]
-            cur = vols.iloc[-1]
-            prior = vols.iloc[-21:-1].dropna()
-            if not pd.isna(cur) and len(prior) == 20:
-                base = float(prior.mean())
-                if base > 0:
-                    r = float(cur) / base
-                    out["vol_ratio"] = round(r, 2)
-                    out["vol_tag"] = "spike" if r >= 1.5 else "normal"
+            # Completed 5m bars only (volume candidate, Nov 4 2026):
+            # the frame's last row is the still-forming entry bar, so
+            # the completed series is every row before it.
+            comp = m5_df.iloc[:-1]
+            vols = comp["Volume"]
+            # (a) vol_ratio on the completed-bar basis: last completed
+            # bar's volume over the mean of the prior 20 completed bars.
+            if len(comp) >= 21:
+                cur = vols.iloc[-1]
+                prior = vols.iloc[-21:-1].dropna()
+                if not pd.isna(cur) and len(prior) == 20:
+                    base = float(prior.mean())
+                    if base > 0:
+                        r = float(cur) / base
+                        out["vol_ratio"] = round(r, 2)
+                        out["vol_tag"] = ("spike" if r >= 1.5
+                                          else "normal")
+            # (b) PULLBACK dry-up proxy (PULLBACK records only): the 3
+            # completed bars immediately before the entry bar (late
+            # pullback) over the 3 completed bars before those (impulse).
+            if level == "PULLBACK" and len(comp) >= 6:
+                late = vols.iloc[-3:].dropna()
+                impulse = vols.iloc[-6:-3].dropna()
+                if len(late) == 3 and len(impulse) == 3:
+                    ib = float(impulse.mean())
+                    if ib > 0:
+                        r = float(late.mean()) / ib
+                        out["pb_vol_ratio"] = round(r, 2)
+                        out["pb_vol_tag"] = ("dry" if r < 0.8 else
+                                             "heavy" if r >= 1.2
+                                             else "normal")
+            # (c) day-pace (RVOL) tag: today's cumulative regular-
+            # session volume through the last completed bar, over the
+            # mean total daily volume of the last 20 completed daily
+            # sessions scaled by the elapsed fraction of the session.
+            if len(comp) and daily_df is not None \
+                    and len(daily_df) >= 20:
+                last_bar = comp.index[-1]
+                if last_bar.strftime("%Y-%m-%d") == today:
+                    dvol = daily_df["Volume"].tail(20).dropna()
+                    todays = comp[comp.index.strftime("%Y-%m-%d")
+                                  == today]
+                    mins = todays.index.hour * 60 + todays.index.minute
+                    todays = todays[(mins >= 9 * 60 + 30)
+                                    & (mins < 16 * 60)]
+                    tvol = todays["Volume"]
+                    elapsed = ((last_bar.hour * 60 + last_bar.minute
+                                + 5) - (9 * 60 + 30))
+                    frac = min(max(elapsed, 0), 390) / 390.0
+                    if len(dvol) == 20 and len(tvol) \
+                            and bool(tvol.notna().all()):
+                        avg_day = float(dvol.mean())
+                        if avg_day > 0 and frac > 0:
+                            r = float(tvol.sum()) / (avg_day * frac)
+                            out["day_pace_ratio"] = round(r, 2)
+                            out["day_pace_tag"] = ("in-play" if r >= 1.5
+                                                   else "normal")
         except Exception:
             pass
     return out
@@ -427,8 +512,12 @@ def parse_report_tickers(path):
     return found
 
 
-def build_universe(notes):
+def _merge_report_universe(notes):
+    """Always-on 7 + today's report names (incl. bench lines), deduped,
+    capped at MAX_UNIVERSE — the pre-Nov-3 ad-hoc merge, unchanged.
+    Returns (tickers, entries) with each name's source recorded."""
     tickers = list(BASE_TICKERS)
+    entries = [{"ticker": t, "source": "always-on"} for t in tickers]
     path = None
     today_name = now_et().strftime("%Y-%m-%d") + ".md"
     cand = os.path.join(REPORTS_DIR, today_name)
@@ -444,15 +533,200 @@ def build_universe(notes):
             log(f"reports dir scan failed: {e}")
     if path is None:
         notes.append("No Morning Desk report found — universe = always-on only.")
-        return tickers
+        return tickers, entries
     extra = parse_report_tickers(path)
     if not extra:
         notes.append(f"No tickers parsed from {os.path.basename(path)} — "
                      "universe = always-on only.")
+    bench = set()
+    try:
+        with open(path) as f:
+            for _line in f:
+                _bm = _TICKER_LINE.match(_line)
+                if _bm and "BENCH" in _line.upper():
+                    bench.add(_bm.group(1))
+    except Exception:
+        pass
     for t in extra:
         if t not in tickers:
             tickers.append(t)
-    return tickers[:MAX_UNIVERSE]
+            entries.append({"ticker": t, "source":
+                            "bench" if t in bench else "report"})
+    tickers = tickers[:MAX_UNIVERSE]
+    return tickers, entries[:len(tickers)]
+
+# ------------------------------------------------- grouped daily universe
+# GROUPED DAILY UNIVERSE + TAPE NAMES (Raj's orders, Nov 3 2026 — "group
+# universe everyday first then use that universe for raj clouds everyday"
+# and "look at [the morning news tape] but make sure more liquid and very
+# less spread stocks only, no junk, no duplicates"): the day's universe is
+# assembled ONCE — the first run at/after 09:30 ET builds it (always-on +
+# report/bench + filtered tape names, deduped, capped at MAX_UNIVERSE,
+# each name's source recorded) and freezes it to UNIVERSE_FILE; every
+# later run that day reads the frozen file. Runs before 09:30 ET keep the
+# old ad-hoc merge and freeze nothing (premarket option quotes are stale,
+# so the tape spread gate is only ever judged on live quotes). Tape names
+# are the LOWEST priority and SCAN COVERAGE ONLY (same status as bench):
+# no direction, no analysis; any entry still needs every normal gate.
+TAPE_DIR = os.path.expanduser("~/workspace/morning-desk/research")
+UNIVERSE_FILE = os.path.join(BASE, "raj-intraday-clouds-universe.json")
+OPTION_QUOTE_PY = os.path.expanduser(
+    "~/workspace/morning-desk/charts/option_quote.py")
+TAPE_MIN_PRICE = 10.0
+TAPE_MIN_DOLLAR_VOL = 50_000_000.0
+TAPE_MAX_SPREAD_PCT = 0.05
+_TAPE_TABLE = re.compile(r"^\|\s*([A-Z]{1,5})\s*\|")
+_TAPE_BOLD = re.compile(r"^-\s+\*\*[^*]+\*\*\s+([A-Z]{1,5})\b")
+
+
+def parse_tape_tickers(path):
+    """Tickers named in the morning news tape: P1/P2 table first cells
+    plus the leading ticker of P3 bold-labelled bullets."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except Exception as e:
+        log(f"tape read failed {path}: {e}")
+        return []
+    found, seen = [], set()
+    for line in lines:
+        m = _TAPE_TABLE.match(line) or _TAPE_BOLD.match(line)
+        if m:
+            t = m.group(1)
+            if t != "TICKER" and t not in seen:
+                seen.add(t)
+                found.append(t)
+    return found
+
+
+def _tape_daily_gate(t, today):
+    """Gates (a)+(b) on completed daily sessions. Returns
+    ((close, avg_dollar_vol), None) or (None, reason) — fail closed."""
+    df = yahoo_bars(t, "1d", "3mo")
+    if df is None or len(df) == 0:
+        return None, "no daily data"
+    d = df.copy()
+    d.index = d.index.tz_convert(ET)
+    d = d[[ix.strftime("%Y-%m-%d") != today for ix in d.index]]
+    if len(d) < 20:
+        return None, f"only {len(d)} completed sessions"
+    close = float(d["Close"].iloc[-1])
+    if close < TAPE_MIN_PRICE:
+        return None, f"price ${close:.2f} < $10 (junk gate)"
+    dvol = float((d["Close"] * d["Volume"]).tail(20).mean())
+    if dvol < TAPE_MIN_DOLLAR_VOL:
+        return None, f"avg $vol ${dvol / 1e6:.1f}M < $50M (liquidity gate)"
+    return (close, dvol), None
+
+
+def _tape_spread_gate(t, fallback_price):
+    """Gate (c): near-ATM front contract via the house option_quote.py
+    route (nearest expiry, call side). Real bid required and spread
+    <= 5% of mid. Returns (spread_pct, None) or (None, reason)."""
+    price = fallback_price
+    try:
+        m5 = yahoo_bars(t, "5m", "1d")
+        if m5 is not None and len(m5) > 0:
+            price = float(m5["Close"].dropna().iloc[-1])
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            [sys.executable, OPTION_QUOTE_PY, t, "LONG", f"{price:.2f}"],
+            capture_output=True, text=True, timeout=40)
+        if r.returncode != 0:
+            return None, "option quote failed"
+        q = json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        return None, f"option quote error: {e}"
+    bid, ask, mid = q.get("bid"), q.get("ask"), q.get("mid")
+    if not bid or bid <= 0 or not ask or not mid or mid <= 0:
+        return None, "no real bid (spread unverified)"
+    pct = (ask - bid) / mid
+    if pct > TAPE_MAX_SPREAD_PCT:
+        return None, f"spread {pct * 100:.1f}% of mid > 5%"
+    return pct, None
+
+
+def _build_grouped_universe(notes, today):
+    """One daily build: merge (always-on/report/bench) + gated tape
+    names by dollar volume until the cap. Returns
+    (tickers, entries, tape_added, tape_excluded)."""
+    tickers, entries = _merge_report_universe(notes)
+    tape_added, tape_excluded = [], []
+    tape_path = os.path.join(TAPE_DIR, f"news-tape-{today}.md")
+    if not os.path.exists(tape_path):
+        notes.append("TAPE NAMES: no tape file for today — grouped "
+                     "universe carries no tape names.")
+        return tickers, entries, tape_added, tape_excluded
+    seen = set(tickers)
+    passed = []
+    for t in parse_tape_tickers(tape_path):
+        if t in seen:
+            continue
+        res, why = _tape_daily_gate(t, today)
+        if res is None:
+            tape_excluded.append({"ticker": t, "reason": why})
+        else:
+            passed.append((t, res[0], res[1]))
+    passed.sort(key=lambda x: -x[2])
+    for t, close, dvol in passed:
+        if len(tickers) >= MAX_UNIVERSE:
+            tape_excluded.append(
+                {"ticker": t, "reason": "universe cap 25 reached"})
+            continue
+        pct, why = _tape_spread_gate(t, close)
+        if pct is None:
+            tape_excluded.append({"ticker": t, "reason": why})
+            continue
+        tickers.append(t)
+        entries.append({"ticker": t, "source": "tape"})
+        tape_added.append({"ticker": t, "close": round(close, 2),
+                           "avg_dollar_vol": round(dvol),
+                           "spread_pct_of_mid": round(pct * 100, 2)})
+    if tape_added:
+        notes.append("TAPE NAMES added: " + ", ".join(
+            a["ticker"] for a in tape_added))
+    if tape_excluded:
+        notes.append("TAPE NAMES excluded: " + "; ".join(
+            f"{e['ticker']} ({e['reason']})" for e in tape_excluded))
+    return tickers, entries, tape_added, tape_excluded
+
+
+def build_universe(notes):
+    now = now_et()
+    today = now.strftime("%Y-%m-%d")
+    try:
+        if os.path.exists(UNIVERSE_FILE):
+            with open(UNIVERSE_FILE) as f:
+                saved = json.load(f)
+            if saved.get("date") == today and saved.get("universe"):
+                notes.append(
+                    f"Grouped universe (built {saved.get('built_at', '?')}"
+                    f"): {len(saved['universe'])} names.")
+                return list(saved["universe"])
+    except Exception as e:
+        log(f"universe file read failed: {e}")
+    if now.hour * 60 + now.minute < 9 * 60 + 30:
+        tickers, _entries = _merge_report_universe(notes)
+        return tickers
+    tickers, entries, t_added, t_excl = _build_grouped_universe(
+        notes, today)
+    built_at = now.strftime("%H:%M ET")
+    try:
+        payload = {"date": today, "built_at": built_at,
+                   "universe": tickers, "entries": entries,
+                   "tape_added": t_added, "tape_excluded": t_excl}
+        tmp = UNIVERSE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=1)
+        os.replace(tmp, UNIVERSE_FILE)
+        notes.append(f"Grouped universe built for {today} at {built_at}: "
+                     f"{len(tickers)} names (sources + tape log in "
+                     f"raj-intraday-clouds-universe.json).")
+    except Exception as e:
+        log(f"universe file write failed: {e}")
+    return tickers
 
 
 # ---------------------------------------------------------------- state file
@@ -631,7 +905,8 @@ def main():
                          "entry_time": open_a["entry_time"],
                          "states": dict(states)}
                     lf = _levels_for(daily, prepost, m5,
-                                     a["entry_price"], today)
+                                     a["entry_price"], today,
+                                     level="CONFIRMED")
                     a.update(lf)
                     alerts.append(a)
                     append_audit({"ts": now.strftime("%Y-%m-%d %H:%M:%S ET"),
@@ -688,7 +963,8 @@ def main():
                              "entry_time": bar_time_s,
                              "states": dict(states)}
                         lf = _levels_for(daily, prepost, m5,
-                                         a["entry_price"], today)
+                                         a["entry_price"], today,
+                                         level="PULLBACK")
                         a.update(lf)
                         alerts.append(a)
                         append_audit({"ts": now.strftime(
@@ -729,7 +1005,8 @@ def main():
                              "entry_time": bar_time_s,
                              "states": dict(states)}
                         lf = _levels_for(daily, prepost, m5,
-                                         a["entry_price"], today)
+                                         a["entry_price"], today,
+                                         level="FIRST")
                         a.update(lf)
                         alerts.append(a)
                         append_audit({"ts": now.strftime("%Y-%m-%d %H:%M:%S ET"),

@@ -3,3 +3,9 @@
 !.gitignore
 !raj-intraday-clouds*.py
 !raj-intraday-clouds.py.bak*
+!option_quote.py
+!option_quote.py.bak*
+!clouds-watcher/
+!clouds-watcher/watcher.py
+!clouds-watcher/chains.py
+!clouds-watcher/README.md

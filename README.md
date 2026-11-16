@@ -136,8 +136,8 @@ Three programs live in this repo:
 2. **`option_quote.py`** — a standalone command-line tool that fetches
    a live Nasdaq option chain and picks the best contract for a
    direction/entry/target (§6). The worker jobs call it to price paper
-   entries; the scanner itself calls it once per candidate tape name
-   during the morning universe build (the spread gate, §4.3).
+   entries; the scanner itself calls it for each tape name that
+   reaches the spread gate during the morning universe build (§4.3).
 3. **`clouds-watcher/`** — a shadow-mode latency package (§7):
    `watcher.py` re-runs the scanner in a sandbox the moment each 5-min
    bar completes so signals are *detected* in seconds, and `chains.py`
@@ -158,7 +158,7 @@ flowchart TD
     G --> H{"Initializing<br/>(first run of day)?"}
     H -- yes --> I["Record states as prev.<br/>No alerts this run."]
     H -- no --> J["Leg state machine (§5):<br/>EXIT → CONFIRMED → pullback arm →<br/>PULLBACK → FIRST, in that order"]
-    J --> K["Append any alert to the audit jsonl<br/>and to state.alerts_today"]
+    J --> K["Append any alert to the audit jsonl;<br/>entry alerts also to state.alerts_today<br/>(EXIT is audit-only)"]
     I --> L{"Time ≥ 16:05 ET?"}
     K --> L
     L -- yes --> M["grade_alerts(): ±0.50% first-touch<br/>grades for today's FIRST/PULLBACK records"]
@@ -346,9 +346,10 @@ day and frozen; intraday runs never change it.
 
    i.e. an optional `1.` or `-` lead, a 1–5 letter uppercase symbol,
    then a `·`, `—`, `–`, or ` - ` separator. The words THE, AND, FOR,
-   TOP, LONG, SHORT, KEY, NEW are rejected as stopwords. A parsed name
-   whose own line also contains "BENCH" gets source tag `bench`; all
-   other report names get `report`.
+   TOP, LONG, SHORT, KEY, NEW are rejected as stopwords. Separately,
+   the whole file is scanned for lines matching the same ticker
+   pattern that also contain "BENCH" — a parsed name found that way
+   gets source tag `bench`; all other report names get `report`.
 3. **News-tape names** (lowest priority; grouped build only, §4.3):
    tickers parsed from `~/workspace/morning-desk/research/news-tape-<today>.md`
    — the first cell of table rows (`| TICKER | ...`) and the leading
@@ -585,10 +586,9 @@ python3 option_quote.py TICKER LONG|SHORT ENTRY_PRICE [TARGET_PRICE]
   `expirygroup` = e.g. `"October 9, 2026"`) followed by that expiry's
   data rows. Groups are parsed to dates; past expiries are dropped.
 - **Expiry picked: today (0DTE) if today is listed, else the nearest
-  future expiry.** There is no way to ask for a different expiry —
-  callers who need a later expiry call again and get the same answer;
-  the nearest-later-expiry choice in the lane is made by the *caller*
-  re-invoking the tool, per its own rules.
+  future expiry.** The tool has no expiry parameter — that choice is
+  the whole policy, and every call for the same ticker on the same
+  day returns the same expiry.
 - The underlying price and quote time are parsed out of the chain's
   `lastTrade` string (`"LAST TRADE: $212.32 (AS OF OCT 8, 2026 3:22 PM ET)"`).
   The "reference price" for strike distance is the underlying when
@@ -651,8 +651,9 @@ with spaces + YYMMDD + C/P + strike × 1000 as 8 digits. `mid` is
 (bid + ask) / 2 rounded to 4 decimals, `null` unless both sides exist.
 `entry_premium` / `target_premium_est` / `option_R` on the top level
 mirror the picked candidate (all `null` in legacy mode). Candidates
-that were skipped appear in `candidates` with their `skipped` reason
-and no R fields.
+that were skipped appear in `candidates` with `option_R: null`, their
+`skipped` reason, and no `entry_premium` / `target_premium_est`
+fields.
 
 ---
 
@@ -799,8 +800,8 @@ file and `os.replace`d into place (atomic on the same filesystem).
   lines, per-ticker skips, sure-shot blocks, the first-run-of-day
   line). Consumers surface them; they are not machine-parsed.
 
-**Alert record** (FIRST / CONFIRMED / PULLBACK; EXIT omits the levels
-fields marked †):
+**Alert record** (FIRST / CONFIRMED / PULLBACK shown; an EXIT record
+omits the levels fields — everything from `pdh` down):
 
 ```json
 {"ticker": "TSLA", "dir": "SHORT", "level": "PULLBACK",
@@ -1111,7 +1112,7 @@ this repository, and a scanner alert is **not** a booked position:
 - **Report/tape parsing is regex-fragile.** A Morning Desk report
   that changes its heading or line format silently changes the
   universe (the run's `notes` flag when nothing parses, but a
-  partial parse looks normal). The stopword list is five words long;
+  partial parse looks normal). The stopword list is eight words long;
   a section line starting with an English word in ticker position
   followed by ` - ` can parse as a ticker.
 - **Nasdaq chains are snapshots.** `option_quote.py` takes the chain

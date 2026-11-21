@@ -25,6 +25,7 @@ Usage: python3 option_quote.py TICKER LONG|SHORT ENTRY_PRICE [TARGET_PRICE]
 """
 import datetime
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -35,6 +36,14 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 API = "https://api.nasdaq.com/api/quote/{t}/option-chain?assetclass=stocks&limit=2000"
 API_ETF = "https://api.nasdaq.com/api/quote/{t}/option-chain?assetclass=etf&limit=2000"
 ET = ZoneInfo("America/New_York")
+
+# DATA SOURCE — switched Fri Nov 20 2026 on Raj's explicit order: chain
+# and quote data now come from the shared Tradier data layer
+# (~/workspace/shared/tradier-data/marketdata.py) — Tradier primary,
+# Nasdaq is the layer's own fallback. The strike-pick logic below is
+# unchanged; only where the chain comes from has moved.
+sys.path.insert(0, os.path.expanduser("~/workspace/shared/tradier-data"))
+import marketdata as _md
 MAX_SPREAD_PCT = 0.60
 RESIDUAL_EXTRINSIC_FRAC = 0.25
 N_CANDIDATES = 5
@@ -96,89 +105,48 @@ def main():
             die("TARGET_PRICE must be a number")
     is_call = direction == "LONG"
 
-    payload = fetch_json(API.format(t=ticker))
-    data = payload.get("data")
-    if not data or not data.get("table", {}).get("rows"):
-        # ETFs (SPY/QQQ/IWM) live under assetclass=etf on Nasdaq's API —
-        # the stocks call returns no rows for them (Raj's order, Oct 29
-        # 2026: index entries take options too). Retry on the ETF chain.
-        payload = fetch_json(API_ETF.format(t=ticker))
-        data = payload.get("data")
-    if not data or not data.get("table", {}).get("rows"):
-        die(f"no option chain data returned for {ticker}")
-
-    # Group rows by expiry. Nasdaq emits a header row (strike None, expirygroup
-    # set) followed by data rows whose expirygroup is '' — track the header.
-    groups = {}   # "October 9, 2026" -> [rows]
-    order = []
-    current = None
-    for r in data["table"]["rows"]:
-        g = (r.get("expirygroup") or "").strip()
-        if r.get("strike") is None:
-            if g:
-                current = g
-                if g not in groups:
-                    groups[g] = []
-                    order.append(g)
-            continue
-        if current and current in groups:
-            groups[current].append(r)
-    if not order:
-        die(f"no expiry groups found for {ticker}")
-
-    def parse_group(g):
-        # "October 9, 2026" -> date
-        return datetime.datetime.strptime(g, "%B %d, %Y").date()
-
+    # Chain via the shared Tradier data layer (Tradier primary, Nasdaq
+    # fallback inside the layer). Expiry pick unchanged: same-day (0DTE)
+    # if listed, else the nearest listed expiry.
     today = datetime.datetime.now(ET).date()
     dated = []
-    for g in order:
+    for dstr in _md.expirations(ticker):
         try:
-            d = parse_group(g)
+            d = datetime.date.fromisoformat(dstr)
         except ValueError:
             continue
-        if d >= today and groups[g]:
-            dated.append((d, g))
+        if d >= today:
+            dated.append(d)
     if not dated:
         die(f"no current/future expiries listed for {ticker}")
     dated.sort()
-    # 0DTE if today is listed, else nearest weekly expiry.
-    exp_date, exp_group = next(((d, g) for d, g in dated if d == today), dated[0])
+    exp_date = today if today in dated else dated[0]
 
-    rows = groups[exp_group]
-    strikes = sorted({fnum(r.get("strike")) for r in rows})
-    strikes = [s for s in strikes if s is not None]
+    rows = _md.chain(ticker, exp_date.isoformat())
+    if not rows:
+        die(f"no option chain data returned for {ticker}")
+    strikes = sorted({r.get("strike") for r in rows
+                      if r.get("strike") is not None})
     if not strikes:
-        die(f"no strikes listed for {ticker} {exp_group}")
+        die(f"no strikes listed for {ticker} {exp_date.isoformat()}")
 
-    # Underlying price + quote time from "LAST TRADE: $212.32 (AS OF OCT 8, 2026 3:22 PM ET)"
-    underlying, quote_time = None, None
-    lt = data.get("lastTrade") or ""
-    m = re.search(r"\$([\d,]+\.?\d*)", lt)
-    if m:
-        underlying = float(m.group(1).replace(",", ""))
-    m2 = re.search(r"AS OF\s+([A-Z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}\s+[AP]M)", lt, re.I)
-    if m2:
-        try:
-            dt = datetime.datetime.strptime(m2.group(1).upper(), "%b %d, %Y %I:%M %p")
-            quote_time = dt.replace(tzinfo=ET).isoformat()
-        except ValueError:
-            quote_time = None
+    # Underlying price from the layer's quote; quote_time is the
+    # chain's own pull time (the layer's asof stamp).
+    q = _md.quotes([ticker]).get(ticker) or {}
+    underlying = q.get("last")
+    quote_time = rows[0].get("asof")
 
     ref = underlying if underlying else entry
+    side = "call" if is_call else "put"
     by_strike = {}
     for r in rows:
-        s = fnum(r.get("strike"))
-        if s is not None and s not in by_strike:
-            by_strike[s] = r
+        if r.get("type") == side and r.get("strike") is not None:
+            by_strike.setdefault(r["strike"], r)
     nearest = sorted(strikes, key=lambda s: (abs(s - ref), s))[:N_CANDIDATES]
 
     def quote_row(strike):
-        row = by_strike[strike]
-        if is_call:
-            bid, ask = fnum(row.get("c_Bid")), fnum(row.get("c_Ask"))
-        else:
-            bid, ask = fnum(row.get("p_Bid")), fnum(row.get("p_Ask"))
+        row = by_strike.get(strike) or {}
+        bid, ask = row.get("bid"), row.get("ask")
         mid = round((bid + ask) / 2, 4) if bid is not None and ask is not None else None
         return bid, ask, mid
 
@@ -216,7 +184,7 @@ def main():
     else:
         viable = [c for c in candidates if c["option_R"] is not None]
         if not viable:
-            die(f"no liquid candidate strikes for {ticker} {exp_group} "
+            die(f"no liquid candidate strikes for {ticker} {exp_date.isoformat()} "
                 f"(all skipped: {[ (c['strike'], c['skipped']) for c in candidates ]})")
         pick = max(viable, key=lambda c: c["option_R"])
 

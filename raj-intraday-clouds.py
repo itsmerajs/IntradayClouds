@@ -102,37 +102,128 @@ def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
 
-# ---------------------------------------------------------------- Yahoo bars
+# ---------------------------------------------------------------- bars
+# DATA SOURCE — switched Fri Nov 20 2026 on Raj's explicit order: bars
+# now come from the shared Tradier data layer
+# (~/workspace/shared/tradier-data/marketdata.py) — Tradier primary, the
+# Yahoo chart API is the layer's own fallback. yahoo_bars keeps its
+# name, signature and return contract (DataFrame with a UTC index and
+# Open/High/Low/Close/Volume columns, or None) so no call site changes.
+# Boundary adaptations, all inside this section:
+#  - Tradier timesales carries no 1h bars: 1h frames are aggregated from
+#    Tradier 5-min bars anchored at the 09:30 ET session open (Yahoo's
+#    native 1h convention — verified against Yahoo's SPY 1h OHLC for
+#    Fri Nov 20 2026 before the switch).
+#  - Tradier serves all-session bars; the old default Yahoo URLs
+#    returned regular-session bars only, so the regular-session
+#    composition is restored by filtering to 09:30-16:00 ET unless
+#    prepost=True.
+#  - Yahoo's intraday responses carried an appended zero-volume quote
+#    point stamped at fetch time, which completed() drops so the
+#    still-forming bar survives; Tradier has no such point, so the shim
+#    appends an equivalent point (last close, zero volume, stamped now)
+#    whenever the last bar is still forming.
+sys.path.insert(0, os.path.expanduser("~/workspace/shared/tradier-data"))
+import marketdata as _md
+
+_RANGE_DAYS = {"1d": 1, "5d": 5, "1mo": 31, "3mo": 93, "6mo": 186,
+               "1y": 365}
+_RANGE_MONTHS = {"1d": 1, "5d": 1, "1mo": 1, "3mo": 3, "6mo": 6,
+                 "1y": 12}
+
+
+def _layer_frame(rows, daily=False):
+    """Shared-layer bar rows -> the DataFrame shape yahoo_bars has
+    always returned (UTC index; daily bars stamped 09:30 ET, the stamps
+    Yahoo's daily bars carry)."""
+    recs = []
+    for r in rows or []:
+        if r.get("close") is None:
+            continue
+        ts = pd.Timestamp(r["time"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(ET)
+        else:
+            ts = ts.tz_convert(ET)
+        if daily and (ts.hour, ts.minute, ts.second) == (0, 0, 0):
+            ts = ts + dt.timedelta(hours=9, minutes=30)
+        recs.append((ts, r.get("open"), r.get("high"), r.get("low"),
+                     r.get("close"), r.get("volume")))
+    if not recs:
+        return None
+    idx = pd.DatetimeIndex([t for t, *_ in recs]).tz_convert("UTC")
+    df = pd.DataFrame([(o, h, l, c, v) for _, o, h, l, c, v in recs],
+                      columns=["Open", "High", "Low", "Close", "Volume"],
+                      index=idx)
+    df = df.dropna(subset=["Close"])
+    return df if len(df) >= 5 else None
+
+
+def _agg_1h_et(d):
+    """Aggregate an ET 5-min frame into 1h bars anchored at the 09:30 ET
+    session open (Yahoo's native 1h convention)."""
+    out = {}
+    for day, seg in d.groupby(d.index.date):
+        anchor = pd.Timestamp(day).tz_localize(ET) \
+            + dt.timedelta(hours=9, minutes=30)
+        for i in range(7):
+            start = anchor + dt.timedelta(hours=i)
+            part = seg[(seg.index >= start)
+                       & (seg.index < start + dt.timedelta(hours=1))]
+            if len(part):
+                out[start] = (part["Open"].iloc[0], part["High"].max(),
+                              part["Low"].min(), part["Close"].iloc[-1],
+                              part["Volume"].sum())
+    if not out:
+        return None
+    idx = pd.DatetimeIndex(sorted(out))
+    return pd.DataFrame([out[t] for t in idx],
+                        columns=["Open", "High", "Low", "Close", "Volume"],
+                        index=idx)
+
+
 def yahoo_bars(ticker, interval, range_, prepost=False):
-    """Fetch OHLCV via Yahoo chart API. Returns DataFrame (UTC index) or None.
-    Same approach as mtf-swing-scan.py's yahoo_bars. prepost=True appends
-    includePrePost (LEVELS instrumentation fetch only — the default URL is
-    byte-identical to the original scanner's)."""
-    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-           f"?interval={interval}&range={range_}&events=div%2Csplit"
-           + ("&includePrePost=true" if prepost else ""))
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, headers=YH_UA)
-            raw = urllib.request.urlopen(req, timeout=15).read()
-            j = json.loads(raw)
-            r = j["chart"]["result"][0]
-            ts = r["timestamp"]
-            q = r["indicators"]["quote"][0]
-            df = pd.DataFrame({
-                "Open": q.get("open"), "High": q.get("high"),
-                "Low": q.get("low"), "Close": q.get("close"),
-                "Volume": q.get("volume"),
-            }, index=pd.to_datetime(ts, unit="s", utc=True))
-            df = df.dropna(subset=["Close"])
-            if len(df) < 5:
+    """Fetch OHLCV via the shared Tradier data layer (Tradier primary;
+    the layer falls back to Yahoo on failure). Returns DataFrame (UTC
+    index) or None — the original return contract. prepost=True keeps
+    all-session bars (LEVELS instrumentation fetch only); the default
+    is regular-session composition, exactly what the original
+    scanner's Yahoo URLs returned."""
+    try:
+        if interval == "1d":
+            return _layer_frame(_md.daily_bars(
+                ticker, months=_RANGE_MONTHS.get(range_, 3)), daily=True)
+        now = now_et()
+        end = now.strftime("%Y-%m-%d %H:%M")
+        start = (now - dt.timedelta(days=_RANGE_DAYS.get(range_, 5))
+                 ).strftime("%Y-%m-%d %H:%M")
+        df = _layer_frame(_md.bars(ticker, "5min", start, end))
+        if df is None:
+            return None
+        d = df.copy()
+        d.index = d.index.tz_convert(ET)
+        # Appended quote point (see header note): only while the last
+        # 5-min bar is still forming.
+        if len(d) and d.index[-1] + dt.timedelta(minutes=5) > now:
+            last_close = float(d["Close"].iloc[-1])
+            pt = pd.DataFrame(
+                [(last_close, last_close, last_close, last_close, 0)],
+                columns=d.columns,
+                index=pd.DatetimeIndex([pd.Timestamp(now)]))
+            d = pd.concat([d, pt])
+        if not prepost:
+            d = d.between_time("09:30", "15:59")
+        if interval in ("1h", "60m"):
+            d = _agg_1h_et(d)
+            if d is None:
                 return None
-            return df
-        except Exception as e:
-            if attempt == 2:
-                log(f"yahoo_bars {ticker} {interval} failed: {e}")
-            time.sleep(1 + attempt * 2)
-    return None
+        d = d.copy()
+        d.index = d.index.tz_convert("UTC")
+        d = d.dropna(subset=["Close"])
+        return d if len(d) >= 5 else None
+    except Exception as e:
+        log(f"yahoo_bars {ticker} {interval} failed: {e}")
+        return None
 
 
 def completed(df, bar_len):

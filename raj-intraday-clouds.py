@@ -132,10 +132,29 @@ _RANGE_MONTHS = {"1d": 1, "5d": 1, "1mo": 1, "3mo": 3, "6mo": 6,
                  "1y": 12}
 
 
+_BAR_SOURCES = set()
+
+
+def _note_bar_sources(rows):
+    for r in rows or []:
+        s = r.get("source")
+        if s:
+            _BAR_SOURCES.add(s)
+
+
+def _bar_sources_value():
+    if not _BAR_SOURCES:
+        return None
+    if len(_BAR_SOURCES) == 1:
+        return next(iter(_BAR_SOURCES))
+    return sorted(_BAR_SOURCES)
+
+
 def _layer_frame(rows, daily=False):
     """Shared-layer bar rows -> the DataFrame shape yahoo_bars has
     always returned (UTC index; daily bars stamped 09:30 ET, the stamps
     Yahoo's daily bars carry)."""
+    _note_bar_sources(rows)
     recs = []
     for r in rows or []:
         if r.get("close") is None:
@@ -1135,7 +1154,8 @@ def main():
 
     save_state(st)
     out = {"quiet": not alerts and not grades, "alerts": alerts,
-           "grades": grades, "universe": universe, "notes": notes}
+           "grades": grades, "universe": universe, "notes": notes,
+           "data_sources": {"bars": _bar_sources_value()}}
     print(json.dumps(out))
 
 
@@ -1145,4 +1165,5 @@ if __name__ == "__main__":
     except Exception as e:  # never raise — emit a quiet JSON with the error
         print(json.dumps({"quiet": True, "alerts": [], "grades": [],
                           "universe": BASE_TICKERS,
-                          "notes": [f"fatal: {e}"]}))
+                          "notes": [f"fatal: {e}"],
+                          "data_sources": {"bars": _bar_sources_value()}}))

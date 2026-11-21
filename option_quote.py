@@ -205,6 +205,8 @@ def main():
         "target_premium_est": pick.get("target_premium_est"),
         "option_R": pick.get("option_R"),
         "candidates": candidates,
+        "data_sources": {"chain": rows[0].get("source"),
+                         "quotes": q.get("source")},
     }
     print(json.dumps(out))
 
